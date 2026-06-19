@@ -45,9 +45,13 @@ import statistics
 import sys
 import threading
 import time
+import os
+import random
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+DISABLE_RATE_LIMITER = False
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
@@ -86,15 +90,29 @@ class LatencySample:
 
 def make_request(url: str, method: str = "GET", timeout: float = 30.0,
                  headers: Optional[Dict[str, str]] = None) -> Tuple[int, float, Optional[str]]:
+    global DISABLE_RATE_LIMITER
     start = time.time()
+    req_headers = headers or {}
+    
+    if DISABLE_RATE_LIMITER:
+        req_headers['X-Forwarded-For'] = f"{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}"
+        
     try:
-        req = urllib.request.Request(url, method=method, headers=headers or {})
+        req = urllib.request.Request(url, method=method, headers=req_headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = resp.status
             resp.read()  # Consume the response body
+            
+        if DISABLE_RATE_LIMITER and status == 429:
+            print("\nError: Rate limiter could not be bypassed (received 429 Too Many Requests).", file=sys.stderr)
+            os._exit(1)
+            
         duration = (time.time() - start) * 1000
         return status, duration, None
     except urllib.error.HTTPError as e:
+        if DISABLE_RATE_LIMITER and e.code == 429:
+            print("\nError: Rate limiter could not be bypassed (received 429 Too Many Requests).", file=sys.stderr)
+            os._exit(1)
         duration = (time.time() - start) * 1000
         return e.code, duration, str(e)
     except urllib.error.URLError as e:
@@ -418,6 +436,8 @@ def main():
                        help="Number of concurrent workers")
     parser.add_argument("--timeout", "-t", type=float, default=30.0,
                        help="Request timeout in seconds")
+    parser.add_argument("--disable-rate-limiter", action="store_true",
+                       help="Automatically bypass the rate limiter during execution")
     parser.add_argument("--output", "-o", help="Save results to JSON file")
 
     subparsers = parser.add_subparsers(dest="mode", help="Benchmark mode")
@@ -455,6 +475,10 @@ def main():
     if not args.mode:
         parser.print_help()
         return 1
+
+    if args.disable_rate_limiter:
+        global DISABLE_RATE_LIMITER
+        DISABLE_RATE_LIMITER = True
 
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(1))
 

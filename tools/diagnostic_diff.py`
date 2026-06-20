@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""
+Diagnostic diff tool for comparing build metadata snapshots.
+Identifies module additions, removals, status changes, duration deltas,
+command changes, and artifact changes between two diagnostic metadata files.
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Dict, List, Any, Tuple
+
+
+def load_diagnostic(path: Path) -> Dict[str, Any]:
+    """Load diagnostic metadata from JSON file."""
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
+def compare_modules(baseline: Dict, newer: Dict) -> Dict[str, Any]:
+    """Compare module metadata between baseline and newer builds."""
+    baseline_modules = {m['name']: m for m in baseline.get('modules', [])}
+    newer_modules = {m['name']: m for m in newer.get('modules', [])}
+    
+    added = set(newer_modules.keys()) - set(baseline_modules.keys())
+    removed = set(baseline_modules.keys()) - set(newer_modules.keys())
+    common = set(baseline_modules.keys()) & set(newer_modules.keys())
+    
+    status_changes = []
+    duration_deltas = []
+    command_changes = []
+    artifact_changes = []
+    regressions = []
+    
+    for name in common:
+        baseline_mod = baseline_modules[name]
+        newer_mod = newer_modules[name]
+        
+        baseline_status = baseline_mod.get('status', 'unknown')
+        newer_status = newer_mod.get('status', 'unknown')
+        
+        if baseline_status != newer_status:
+            status_changes.append({
+                'module': name,
+                'baseline': baseline_status,
+                'newer': newer_status
+            })
+            
+            # Detect regressions: pass -> fail/error/missing
+            if baseline_status == 'pass' and newer_status in ('fail', 'error', 'missing'):
+                regressions.append({
+                    'type': 'status_regression',
+                    'module': name,
+                    'baseline_status': baseline_status,
+                    'newer_status': newer_status
+                })
+        
+        baseline_duration = baseline_mod.get('duration', 0)
+        newer_duration = newer_mod.get('duration', 0)
+        if baseline_duration != newer_duration:
+            delta = newer_duration - baseline_duration
+            duration_deltas.append({
+                'module': name,
+                'baseline': baseline_duration,
+                'newer': newer_duration,
+                'delta': delta
+            })
+        
+        baseline_cmd = baseline_mod.get('command', '')
+        newer_cmd = newer_mod.get('command', '')
+        if baseline_cmd != newer_cmd:
+            command_changes.append({
+                'module': name,
+                'baseline': baseline_cmd,
+                'newer': newer_cmd
+            })
+        
+        baseline_artifacts = set(baseline_mod.get('artifacts', []))
+        newer_artifacts = set(newer_mod.get('artifacts', []))
+        if baseline_artifacts != newer_artifacts:
+            artifact_changes.append({
+                'module': name,
+                'added': list(newer_artifacts - baseline_artifacts),
+                'removed': list(baseline_artifacts - newer_artifacts)
+            })
+    
+    # Check removed modules as potential regressions (previously passing modules now missing)
+    for name in removed:
+        if baseline_modules[name].get('status') == 'pass':
+            regressions.append({
+                'type': 'module_removed',
+                'module': name,
+                'baseline_status': 'pass',
+                'newer_status': 'missing'
+            })
+    
+    return {
+        'added_modules': sorted(added),
+        'removed_modules': sorted(removed),
+        'status_changes': status_changes,
+        'duration_deltas': duration_deltas,
+        'command_changes': command_changes,
+        'artifact_changes': artifact_changes,
+        'regressions': regressions
+    }
+
+
+def format_output(comparison: Dict[str, Any], verbose: bool = False) -> str:
+    """Format comparison results as human-readable text."""
+    lines = []
+    
+    if comparison['added_modules']:
+        lines.append(f"Added modules ({len(comparison['added_modules'])}):")
+        for name in comparison['added_modules']:
+            lines.append(f"  + {name}")
+        lines.append("")
+    
+    if comparison['removed_modules']:
+        lines.append(f"Removed modules ({len(comparison['removed_modules'])}):")
+        for name in comparison['removed_modules']:
+            lines.append(f"  - {name}")
+        lines.append("")
+    
+    if comparison['status_changes']:
+        lines.append(f"Status changes ({len(comparison['status_changes'])}):")
+        for change in comparison['status_changes']:
+            lines.append(f"  {change['module']}: {change['baseline']} → {change['newer']}")
+        lines.append("")
+    
+    if verbose and comparison['duration_deltas']:
+        lines.append(f"Duration deltas ({len(comparison['duration_deltas'])}):")
+        for delta in comparison['duration_deltas']:
+            sign = '+' if delta['delta'] >= 0 else ''
+            lines.append(f"  {delta['module']}: {sign}{delta['delta']}s")
+        lines.append("")
+    
+    if verbose and comparison['command_changes']:
+        lines.append(f"Command changes ({len(comparison['command_changes'])}):")
+        for change in comparison['command_changes']:
+            lines.append(f"  {change['module']}:")
+            lines.append(f"    baseline: {change['baseline']}")
+            lines.append(f"    newer:    {change['newer']}")
+        lines.append("")
+    
+    if verbose and comparison['artifact_changes']:
+        lines.append(f"Artifact changes ({len(comparison['artifact_changes'])}):")
+        for change in comparison['artifact_changes']:
+            lines.append(f"  {change['module']}:")
+            if change['added']:
+                lines.append(f"    + {', '.join(change['added'])}")
+            if change['removed']:
+                lines.append(f"    - {', '.join(change['removed'])}")
+        lines.append("")
+    
+    return '\n'.join(lines)
+
+
+def format_regressions(regressions: List[Dict[str, Any]]) -> str:
+    """Format detected regressions for output."""
+    if not regressions:
+        return "No regressions detected."
+    
+    lines = [f"REGRESSIONS DETECTED ({len(regressions)}):"]
+    for reg in regressions:
+        if reg['type'] == 'status_regression':
+            lines.append(f"  ✗ {reg['module']}: {reg['baseline_status']} → {reg['newer_status']}")
+        elif reg['type'] == 'module_removed':
+            lines.append(f"  ✗ {reg['module']}: previously passing, now missing")
+    
+    return '\n'.join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Compare diagnostic metadata from two builds'
+    )
+    parser.add_argument(
+        'baseline',
+        type=Path,
+        help='Baseline diagnostic metadata file (JSON)'
+    )
+    parser.add_argument(
+        'newer',
+        type=Path,
+        help='Newer diagnostic metadata file to compare (JSON)'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Include duration deltas, command changes, and artifact changes'
+    )
+    parser.add_argument(
+        '--fail-on-regression',
+        action='store_true',
+        help='Exit with non-zero status if regressions are detected (pass→fail/error/missing)'
+    )
+    parser.add_argument(
+        '--json',
+        action='store_true',
+        help='Output results in JSON format'
+    )
+    
+    args = parser.parse_args()
+    
+    if not args.baseline.exists():
+        print(f"Error: Baseline file not found: {args.baseline}", file=sys.stderr)
+        return 1
+    
+    if not args.newer.exists():
+        print(f"Error: Newer file not found: {args.newer}", file=sys.stderr)
+        return 1
+    
+    baseline = load_diagnostic(args.baseline)
+    newer = load_diagnostic(args.newer)
+    
+    comparison = compare_modules(baseline, newer)
+    
+    if args.json:
+        print(json.dumps(comparison, indent=2))
+    else:
+        print(format_output(comparison, args.verbose))
+        
+        if args.fail_on_regression:
+            print("\n" + "="*60)
+            print(format_regressions(comparison['regressions']))
+            print("="*60)
+    
+    if args.fail_on_regression and comparison['regressions']:
+        return 1
+    
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
